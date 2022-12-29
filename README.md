@@ -1,4 +1,4 @@
 # Training
-To start training run the following commands:\n
-`cd DynamicEnv`
-`python train.py`
+To start training run the following commands:  
+`cd DynamicEnv`  
+`python train.py`  
