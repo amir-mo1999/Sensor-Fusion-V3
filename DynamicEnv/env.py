@@ -130,8 +130,8 @@ class Env(gym.Env):
 
         # parameters of augmented targets for training
         if self.is_train:
-            self.distance_threshold = 0.1
-            self.distance_threshold_last = 0.1
+            self.distance_threshold = 0.4
+            self.distance_threshold_last = 0.4
             self.distance_threshold_increment_p = 0.001
             self.distance_threshold_increment_m = 0.01
             self.distance_threshold_max = 0.4
