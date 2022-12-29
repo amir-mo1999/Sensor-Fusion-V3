@@ -1,7 +1,6 @@
 import sys
 import os
 import numpy as np
-import open3d.cpu.pybind.geometry
 import pandas
 import pybullet as p
 import pybullet_data
@@ -163,7 +162,7 @@ class Env(gym.Env):
 
         return depthImg, segImg
 
-    def _rgb_depth_to_point_cloud(self, rgb: np.array, depth: np.array) -> open3d.geometry.PointCloud:
+    def _rgb_depth_to_point_cloud(self, rgb: np.array, depth: np.array) -> o3d.geometry.PointCloud:
         """
         Create a point cloud from an RGB and depth image. The images are assumed to have the same resolution.
         The transformation assumes a Pinhole Camera model. The models intrinsic and extrinsic parameters are calculated
@@ -208,7 +207,7 @@ class Env(gym.Env):
 
         return pcd
 
-    def _preprocess_point_cloud(self, pcd: open3d.geometry.PointCloud) -> open3d.geometry.PointCloud:
+    def _preprocess_point_cloud(self, pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
         """
         Preprocess a point cloud by applying the following steps:
         1. Mirror the point cloud in y and z direction
