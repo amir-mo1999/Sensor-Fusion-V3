@@ -1,0 +1,2 @@
+- added minimal distances of all link to obstacle points as additional observation
+- deactivated lidar observation
