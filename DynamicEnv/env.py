@@ -1,6 +1,7 @@
 import sys
 import os
 import numpy as np
+from numpy import newaxis as na
 import pandas
 import pybullet as p
 import pybullet_data
@@ -13,9 +14,7 @@ from typing import Tuple, List
 import logging
 import copy
 from collections import deque
-import open3d as o3d
 from sklearn.metrics.pairwise import euclidean_distances
-
 
 CURRENT_PATH = os.path.abspath(__file__)
 BASE = os.path.dirname(os.path.dirname(CURRENT_PATH))
@@ -68,14 +67,9 @@ class Env(gym.Env):
         self.z_high_obs = workspace[5]
 
         # set camera
-        self.camera_x = p.addUserDebugParameter("Camera X", 0, 2, 0.1)
-        self.camera_y = p.addUserDebugParameter("Camera Y", 0, 2, 1)
-        self.camera_z = p.addUserDebugParameter("Camera Z", 0, 2, 0.45)
         self._set_camera_matrices()
 
-
-
-        # for the moving 
+        # for the moving
         self.direction = moving_init_direction
         self.moving_xy = moving_init_axis  # 0 for x, 1 for y
         self.moving_obstacle_speed = moving_obstacle_speed
@@ -83,10 +77,22 @@ class Env(gym.Env):
         self.action = None
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)  # angular velocities
 
-        # set matrices of top and front camera as well as the image widths
+        # set matrices of camera as well as the image widths
         self.img_width = 176
         self.img_height = 120
         self._set_camera_matrices()
+
+        # set DataFrame for transforming segmentation mask to an RGB image
+        translation_dic_red = pandas.DataFrame.from_dict(
+            {-1: 230, 0: 60, 1: 255, 2: 0, 3: 245, 4: 145, 5: 70, 6: 240, 7: 210, 8: 250, 9: 0,
+             10: 220, 11: 170}, orient="index", columns=["r"])
+        translation_dic_green = pandas.DataFrame.from_dict(
+            {-1: 25, 0: 180, 1: 225, 2: 130, 3: 130, 4: 30, 5: 240, 6: 50, 7: 245, 8: 190, 9: 128,
+             10: 190, 11: 110}, orient="index", columns=["g"])
+        translation_dic_blue = pandas.DataFrame.from_dict(
+            {-1: 75, 0: 75, 1: 25, 2: 200, 3: 48, 4: 180, 5: 240, 6: 230, 7: 60, 8: 212, 9: 128,
+             10: 255, 11: 40}, orient="index", columns=["b"])
+        self.df_seg_to_rgb = pandas.concat([translation_dic_red, translation_dic_green, translation_dic_blue], axis=1)
 
         # parameters for spatial infomation
         self.home = [0, np.pi / 2, -np.pi / 6, -2 * np.pi / 3, -4 * np.pi / 9, np.pi / 2, 0.0]
@@ -100,14 +106,16 @@ class Env(gym.Env):
 
         # observation space
         self.state = np.zeros((14,), dtype=np.float32)
-        self.obs_rays = np.zeros(shape=(129,), dtype=np.float32)
-        self.indicator = np.zeros((10,), dtype=np.int8)
-        self.distance_to_obstacles = np.zeros((1,), dtype=np.float32)
+        # self.obs_rays = np.zeros(shape=(129,), dtype=np.float32)
+        # self.indicator = np.zeros((10,), dtype=np.int8)
+        self.distances_to_obstacles = np.zeros((8,), dtype=np.float32)
+
         obs_spaces = {
             'position': spaces.Box(low=-2, high=2, shape=(14,), dtype=np.float32),
-            'indicator': spaces.Box(low=0, high=2, shape=(10,), dtype=np.int8),
-            "distance_to_obstacles": spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)
+            #'indicator': spaces.Box(low=0, high=2, shape=(10,), dtype=np.int8),
+            "distances_to_obstacles": spaces.Box(low=0, high=100, shape=(8,), dtype=np.float32),
         }
+
         self.observation_space = spaces.Dict(obs_spaces)
 
         # step counter
@@ -129,8 +137,8 @@ class Env(gym.Env):
 
         # parameters of augmented targets for training
         if self.is_train:
-            self.distance_threshold = 0.4
-            self.distance_threshold_last = 0.4
+            self.distance_threshold = 0.15
+            self.distance_threshold_last = 0.15
             self.distance_threshold_increment_p = 0.001
             self.distance_threshold_increment_m = 0.01
             self.distance_threshold_max = 0.4
@@ -150,7 +158,7 @@ class Env(gym.Env):
 
     def _get_image(self) -> Tuple[List[float], List[int]]:
         """
-        Retrieve a depth image and the segmentation mask from the camera sensor.
+        Retrieve a depth image and a segmentation mask from the camera sensor.
         :return: The depth image and the segmentation mask
         :rtype: Tuple[List[float], List[int]]
         """
@@ -162,158 +170,104 @@ class Env(gym.Env):
 
         return depthImg, segImg
 
-    def _rgb_depth_to_point_cloud(self, rgb: np.array, depth: np.array) -> o3d.geometry.PointCloud:
+    def _depth_img_to_point_cloud(self, depth: np.array) -> np.array:
         """
-        Create a point cloud from an RGB and depth image. The images are assumed to have the same resolution.
-        The transformation assumes a Pinhole Camera model. The models intrinsic and extrinsic parameters are calculated
-        from the view and projection matrices of camera.
-        sensor in the pybullet simulation.
-        :param rgb: an RGB image
-        :type rgb: np.array
-        :param depth: a depth image
+        Compute a point cloud from a given depth image. The computation is done according to this stackoverflow post:
+        https://stackoverflow.com/questions/59128880/getting-world-coordinates-from-opengl-depth-buffer
+        :param depth: input depth image;
+        the amount of points in the image should equal the product of the camera sensors pixel width and height
         :type depth: np.array
-        :return: the point cloud that was derived from the RGB and depth images.
-        :rtype: open3d.geometry.PointCloud
+        :return: The point cloud in the shape [width x height, 3]
+        :rtype: np.array
         """
-        # Turn projection matrix into numpy array and reshape
-        proj_matrix = np.array(self.camera_proj_matrix).reshape([4, 4])
+        # set width and height
+        W = np.arange(0, self.img_width)
+        H = np.arange(0, self.img_height)
 
-        # Set base intrinsic parameters of camera
-        intrinsic = o3d.camera.PinholeCameraIntrinsic()
-        # calculate intrinsic parameters from opengl projection matrix as specified here:
-        # https://stackoverflow.com/questions/22064084/how-to-create-perspective-projection-matrix-given-focal-points-and-camera-princ/22064917#22064917
-        fx = self.img_width * proj_matrix[0, 0] / 2
-        fy = self.img_height * proj_matrix[1, 1] / 2
-        cx = (proj_matrix[2, 0] + 1) * self.img_width / 2
-        cy = (proj_matrix[2, 1] + 1) * self.img_height / 2
-        intrinsic.set_intrinsics(width=self.img_width, height=self.img_height, fx=fx, fy=fy, cx=cx, cy=cy)
+        # compute pixel coordinates
+        X = ((2 * W - self.img_width) / self.img_width)[na, :].repeat(self.img_height, axis=0).flatten()[:, na]
+        Y = (-1 * (2 * H - self.img_height) / self.img_height)[:, na].repeat(self.img_width, axis=1).flatten()[:, na]
+        Z = (2 * depth - 1).flatten()[:, na]
 
-        # Save RGB and depth images as open3d image objects
-        rgb = o3d.geometry.Image(rgb[:, :, 0:3].astype(np.uint8))
-        depth = o3d.geometry.Image(depth)
+        # transform pixel coordinates into real world ones
+        num_of_pixels = self.img_width * self.img_height
+        PixPos = np.concatenate([X, Y, Z, np.ones(num_of_pixels)[:, na]], axis=1)
+        points = np.tensordot(self.tran_pix_world, PixPos, axes=(1, 1)).swapaxes(0, 1)
+        points = (points / points[:, 3][:, na])[:, 0:3]
 
-        # Join RGB and depth images into a single RGB-D image
-        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(color=rgb,
-                                                                  depth=depth,
-                                                                  convert_rgb_to_intensity=False,
-                                                                  depth_scale=1)
+        return points
 
-        # Create point cloud from RGB-D image using the calculated intrinsic parameters and the camera sensors
-        # view matrix for the extrinsic parameters
-        pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
-            image=rgbd,
-            intrinsic=intrinsic,
-            extrinsic=np.array(self.camera_view_matrix).reshape([4, 4]))
-
-        return pcd
-
-    def _preprocess_point_cloud(self, pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
+    def _prepreprocess_point_cloud(self, points: np.array, segImg: np.array) -> Tuple[np.array, np.array]:
         """
-        Preprocess a point cloud by applying the following steps:
-        1. Mirror the point cloud in y and z direction
-        2. Remove points for background and for the target of the robot arm
-        :param pcd: a point cloud
-        :type pcd: open3d.geometry.PointCloud
-        :return: the preprocessed point cloud
-        :rtype: open3d.geometry.PointCloud
+        Preprocess a point cloud by removing its points for the background, the points for the target and
+        the points for the robot arm
+        :param points: an array containing the x, y and z coordinates
+        of the point cloud in the shape [width x height, 3]
+        :type points: np.array
+        :param segImg: an array containing the segmentation mask given by pybullet; number of entries needs to equal
+        width x height
+        :type segImg: np.array
+        :return: the points of the point cloud with the points for the background, robot arm and target removed
+        :rtype: np.array
         """
-        # Mirror point cloud
-        pcd.transform([[1, 0, 0, 0], [0, -1, 0, 1], [0, 0, -1, 0.5], [0, 0, 0, 1]])
-
-        # remove background and the target point
-        pcd_points = np.asarray(pcd.points)
-        pcd_colors = np.asarray(pcd.colors)
         # Points that have the same color as the first point in the point cloud are removed
         # Points that have the color [60, 180, 75] are removed, as this is the color used for the target point
-        select_map = np.logical_and(
-            (pcd_colors != pcd_colors[0, :]).any(axis=1),
-            np.logical_not(((pcd_colors * 255).round(0) == np.asarray([60, 180, 75])).all(axis=1)))
+        segImg = segImg.flatten()
+        select_mask = segImg > 0
+        points = points[select_mask]
+        segImg = segImg[select_mask]
 
-        pcd.points = o3d.utility.Vector3dVector(pcd_points[select_map])
-        pcd.colors = o3d.utility.Vector3dVector(pcd_colors[select_map])
+        # get the index in the segmentation mask of the robot arm
+        robot_arm_index = np.bincount(segImg).argmax()
 
-        return pcd
+        # remove robot arm
+        points = points[segImg != robot_arm_index]
 
-    def _set_min_distance_of_robot_to_obstacle(self) -> None:
+        return points
+
+    def _set_min_distances_of_robot_to_obstacle(self) -> np.array:
         """
-        Compute the minimal euclidean distance of the robot arm to the obstacles from a point cloud derived
-        from the data given by the camera sensor. The calculation is done as follows:
-        1. Retrieve points of robot arm and obstacles
-        2. Compute the mean point for each obstacle
-        3. Compute the minimal euclidean distance from the points of the robot arm to the mean points of the obstacles
-        :return: None
+        Compute and set the minimal euclidean distance between the coordinates of the centers of mass of the robot link
+        to the obstacles points given by the scene point cloud.
+        :return: obstacle points
+        :rtype: np.array
         """
-        # Retrieve depth image and segmentation mask from camera sensor
-        depthImg, segImg = self._get_image()
-        # turn segmentation mask into a RGB image
-        segImgToRGB = self._seg_mask_to_rgb(segImg)
+        # get depth image and segmentation mask
+        depth, seg = self._get_image()
 
-        # create point cloud
-        pcd = self._rgb_depth_to_point_cloud(segImgToRGB, depthImg)
-        pcd = self._preprocess_point_cloud(pcd)
-        pcd_points = np.asarray(pcd.points)
-        pcd_colors = np.asarray(pcd.colors)
+        # compute point cloud of obstacles
+        points = self._depth_img_to_point_cloud(depth)
 
-        # save point cloud as DataFrame
-        df = pandas.concat([
-            pandas.DataFrame(pcd_points, columns=["x", "y", "z"]),
-            pandas.DataFrame(pcd_colors, columns=["r", "g", "b"])], axis=1
-        )
+        # preprocess point cloud
+        points = self._prepreprocess_point_cloud(points, seg)
 
-        # Group DataFrame by color
-        df_groups = df.groupby(["r", "g", "b"])
-        # Set the color of the robot arm as the color of the largest group in the DataFrame
-        robot_arm_color = list(df_groups.groups.keys())[df_groups["x"].count().argmax()]
-        # Retrieve the points of the robot arm
-        robot_arm = np.asarray(df_groups.get_group(list(df_groups.groups.keys())[df_groups["x"].count().argmax()])[["x", "y", "z"]])
-        # retrieve the points of the obstacles and calculate the mean for each obstacle
-        obstacles = df[(df["r"] != robot_arm_color[0]) & (df["g"] != robot_arm_color[1]) & (df["b"] != robot_arm_color[2])]
-        obstacles = np.asarray(obstacles.groupby(["r", "g", "b"]).mean()[["x", "y", "z"]])
+        # p.addUserDebugPoints(points, np.tile([0, 0, 255], points.shape[0]).reshape(points.shape), pointSize=3)
+        # time.sleep(100)
+        # get coordinates of every links center of mass
+        link_center_of_mass_coordinates = []
+        for i in range(p.getNumJoints(self.RobotUid)):
+            link_center_of_mass_coordinates.append(p.getLinkState(self.RobotUid, i)[0])
+        link_center_of_mass_coordinates = np.asarray(link_center_of_mass_coordinates, dtype=np.float32)
 
-        # compute the minimal euclidean distance between the robot arm the means of the obstacles
-        if obstacles.shape[0] == 0:
-            distance_to_obstacles = 1
+        # Compute minimal euclidean distance from the coordinates of every links center of mass to every obstacle point
+        if points.shape[0] == 0:
+            distances_to_obstacles = np.repeat(100, 8)
         else:
-            distance_to_obstacles = euclidean_distances(robot_arm, obstacles).min()
-        self.distance_to_obstacles = np.array([distance_to_obstacles, ], dtype=np.float32)
+            distances_to_obstacles = euclidean_distances(link_center_of_mass_coordinates, points).min(axis=1).round(10)
 
-    def _seg_mask_to_rgb(self, segImg: List[int]):
+        self.distances_to_obstacles = distances_to_obstacles.astype(np.float32)
+
+        return points
+
+    def _seg_mask_to_rgb(self, segImg: np.array) -> np.array:
         """
-        Transform a pybullet segmentation mask into a rgb image by giving each class a distinctive color.
-        :param segImg: a pybullet segmentation mask
-        :type segImg: List[int]
+        Transform a pybullet segmentation mask into an RGB image by assigning a unqiue color to each class.
+        :param segImg: a pybullet segmentation mask; its amount of entries should equal
+        the product of the camera sensors pixel width and height
+        :type segImg: np.array
         """
-
-        translation_dic_red = {-1: 230, 0: 60, 1: 255, 2: 0, 3: 245, 4: 145, 5: 70, 6: 240, 7: 210, 8: 250, 9: 0, 10: 220, 11: 170}
-        translation_dic_green = {-1: 25, 0: 180, 1: 225, 2: 130, 3: 130, 4: 30, 5: 240, 6: 50, 7: 245, 8: 190, 9: 128, 10: 190, 11: 110}
-        translation_dic_blue = {-1: 75, 0: 75, 1: 25, 2: 200, 3: 48, 4: 180, 5: 240, 6: 230, 7: 60, 8: 212, 9: 128, 10: 255, 11: 40}
-
-        segImgToRGB = np.zeros([self.img_height, self.img_width, 3])
-
-        # put the red values
-        k = np.array(list(translation_dic_red.keys()))
-        v = np.array(list(translation_dic_red.values()))
-        mapping_ar = np.zeros(k.max() + 1, dtype=v.dtype)  # k,v from approach #1
-        mapping_ar[k] = v
-        segImgToRGB[:, :, 0] = mapping_ar[segImg]
-
-        # put the green values
-        segImgToRGB[:, :, 0] = np.vectorize(translation_dic_red.get)(segImg)
-        k = np.array(list(translation_dic_green.keys()))
-        v = np.array(list(translation_dic_green.values()))
-        mapping_ar = np.zeros(k.max() + 1, dtype=v.dtype)  # k,v from approach #1
-        mapping_ar[k] = v
-        segImgToRGB[:, :, 1] = mapping_ar[segImg]
-
-        # put the blue values
-        segImgToRGB[:, :, 0] = np.vectorize(translation_dic_red.get)(segImg)
-        k = np.array(list(translation_dic_blue.keys()))
-        v = np.array(list(translation_dic_blue.values()))
-        mapping_ar = np.zeros(k.max() + 1, dtype=v.dtype)  # k,v from approach #1
-        mapping_ar[k] = v
-        segImgToRGB[:, :, 2] = mapping_ar[segImg]
-
-        return segImgToRGB
+        segImg = segImg.flatten()
+        return np.asarray(self.df_seg_to_rgb.loc[segImg])
 
     def _set_camera_matrices(self) -> None:
         """
@@ -336,10 +290,10 @@ class Env(gym.Env):
             cameraEyePosition, cameraTargetPosition, cameraUpVector
         )
 
-        # Add a debug line between the camera eye and the up vector in green and one between the eye and the target
-        # in red
-        p.addUserDebugLine(cameraEyePosition, cameraTargetPosition, lineColorRGB=[1, 0, 0], lifeTime=0.2)
-        p.addUserDebugLine(cameraEyePosition, cameraEyePosition + cameraUpVector, lineColorRGB=[0, 1, 0], lifeTime=0.2)
+        # # Add a debug line between the camera eye and the up vector in green and one between the eye and the target
+        # # in red
+        # p.addUserDebugLine(cameraEyePosition, cameraTargetPosition, lineColorRGB=[1, 0, 0], lifeTime=0.2)
+        # p.addUserDebugLine(cameraEyePosition, cameraEyePosition + cameraUpVector, lineColorRGB=[0, 1, 0], lifeTime=0.2)
 
         # Set the projection matrix with hardcoded values
         self.camera_proj_matrix = p.computeProjectionMatrixFOV(
@@ -347,6 +301,10 @@ class Env(gym.Env):
             aspect=1,
             nearVal=0.2,
             farVal=1)
+
+        # set transformation matrix to retrieve real world coordinates from pixel coordinates
+        self.tran_pix_world = np.linalg.inv(np.matmul(np.asarray(self.camera_proj_matrix).reshape([4, 4], order='F'),
+                                                      np.asarray(self.camera_view_matrix).reshape([4, 4], order='F')))
 
     def _set_home(self):
 
@@ -464,13 +422,10 @@ class Env(gym.Env):
 
     def reset(self):
         p.resetSimulation()
-        # print(time.time())
+
         self.init_home, self.init_orn = self._set_home()
 
-        # print(self.init_home, self.init_orn)
         self.target_position, self.obsts = self._add_obstacles()
-        # for ob in self.obsts:
-        #     print(p.getBasePositionAndOrientation(ob))
 
         if self.extra_obst:
             self.moving_xy = choice([0, 1])
@@ -527,14 +482,13 @@ class Env(gym.Env):
         self.current_orn = p.getLinkState(self.RobotUid, self.effector_link)[5]
 
         self.current_joint_position = [0]
-        # get lidar observation
-        lidar_results = self._set_lidar_cylinder()
-        for i, ray in enumerate(lidar_results):
-            self.obs_rays[i] = ray[2]
-        rc = RaysCauculator(self.obs_rays)
-        self.indicator = rc.get_indicator()
 
-        # print (self.indicator)
+        # # get lidar observation
+        # lidar_results = self._set_lidar_cylinder()
+        # for i, ray in enumerate(lidar_results):
+        #     self.obs_rays[i] = ray[2]
+        # rc = RaysCauculator(self.obs_rays)
+        # self.indicator = rc.get_indicator()
 
         for i in range(self.base_link, self.effector_link):
             self.current_joint_position.append(p.getJointState(bodyUniqueId=self.RobotUid, jointIndex=i)[0])
@@ -609,14 +563,14 @@ class Env(gym.Env):
             self.current_joint_position.append(p.getJointState(bodyUniqueId=self.RobotUid, jointIndex=i)[0])
 
         # logging.debug("self.current_pos={}\n".format(self.current_pos))
-
-        # get lidar observation
-        lidar_results = self._set_lidar_cylinder()
-        for i, ray in enumerate(lidar_results):
-            self.obs_rays[i] = ray[2]
-        # print (self.obs_rays)
-        rc = RaysCauculator(self.obs_rays)
-        self.indicator = rc.get_indicator()
+        #
+        # # get lidar observation
+        # lidar_results = self._set_lidar_cylinder()
+        # for i, ray in enumerate(lidar_results):
+        #     self.obs_rays[i] = ray[2]
+        # # print (self.obs_rays)
+        # rc = RaysCauculator(self.obs_rays)
+        # self.indicator = rc.get_indicator()
 
         # print (self.indicator)    
         # check collision
@@ -685,7 +639,7 @@ class Env(gym.Env):
             reward += -0.01 * self.distance
 
             # add reward for distance to obstacles
-            reward += -1 * np.exp(-15 * self.distance_to_obstacles[0])
+            reward += -1 * np.exp(-20 * self.distances_to_obstacles.min())
 
         info = {'step': self.step_counter,
                 'out': out,
@@ -694,7 +648,7 @@ class Env(gym.Env):
                 'collided': self.collided,
                 'shaking': shaking,
                 'is_success': is_success,
-                "distance_to_obstacles": self.distance_to_obstacles[0]}
+                "min_distance_to_obstacles": self.distances_to_obstacles.min()}
 
         if self.terminated:
             print(info)
@@ -702,8 +656,8 @@ class Env(gym.Env):
         return self._get_obs(), reward, self.terminated, info
 
     def _get_obs(self):
-        # set distance between robot arm and obstacles
-        self._set_min_distance_of_robot_to_obstacle()
+        # set distance between robot arm and obstacles points
+        self._set_min_distances_of_robot_to_obstacle()
 
         # Set other observations
         self.state[0:6] = self.current_joint_position[1:]
@@ -711,13 +665,15 @@ class Env(gym.Env):
         self.state[9:13] = self.current_orn
         self.distance = np.linalg.norm(np.asarray(list(self.current_pos)) - np.asarray(self.target_position), ord=None)
         self.past_distance.append(self.distance)
+
         if len(self.past_distance) > 10:
             self.past_distance.popleft()
         self.state[13] = self.distance
+
         return {
             'position': self.state,
-            'indicator': self.indicator,
-            "distance_to_obstacles": self.distance_to_obstacles
+            # 'indicator': self.indicator,
+            "distances_to_obstacles": self.distances_to_obstacles,
         }
 
     def _set_lidar_cylinder(self, ray_min=0.02, ray_max=0.2, ray_num_ver=10, ray_num_hor=12, render=False):
@@ -785,16 +741,14 @@ class Env(gym.Env):
 
 
 if __name__ == '__main__':
-
     env = Env(is_render=False, is_good_view=False, add_moving_obstacle=False)
     episodes = 100
     for episode in range(episodes):
         state = env.reset()
         done = False
         i = 0
+        time_for_distance_to_obstacles = []
         while not done:
             action = env.action_space.sample()
             obs, reward, done, info = env.step(action)
-            print(info)
-
-
+            # print(info)

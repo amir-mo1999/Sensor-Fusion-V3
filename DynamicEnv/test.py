@@ -64,4 +64,4 @@ if __name__=='__main__':
         while not done:
             action, _states = model.predict(obs)
             obs, rewards, done, info = env.step(action)
-            print(info)
+            # print(info)
